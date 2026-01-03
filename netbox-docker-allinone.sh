@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # NetBox Docker All-in-One Installer & Manager (+ Discovery + Plugins)
-# Version: 1.9.14
+# Version: 1.9.15
 # Baseline: v1.2.8 (LOCKED)
 # ============================================================
 # v1.3.x features (kept intact):
@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.9.14"
+SCRIPT_VERSION="1.9.15"
 
 # Script identity (helps detect running the wrong file/version)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -46,7 +46,7 @@ fi
 REAL_USER="${SUDO_USER:-root}"
 
 # ------------------------------------------------------------
-# Begin 1.9.14 additions
+# Begin 1.9.15 additions
 # ------------------------------------------------------------
 ### =================================================
 ### BEGIN - NETBOX AUTH / TOKEN / PRIVILEGE FRAMEWORK
@@ -74,6 +74,93 @@ fi
 #   RO  = read-only discovery / diff
 #   RW  = write / apply / reconcile
 ########################################
+
+########################################
+# TOKEN GENERATION
+########################################
+
+generate_netbox_tokens() {
+    local secrets_file="/opt/netbox/secrets/secrets.env"
+    local log_dir="/opt/netbox/logs"
+    local timestamp
+    timestamp=$(date +"%Y%m%d-%H%M%S")
+    local log_file="${log_dir}/token-gen-${timestamp}.log"
+    local container="netbox"
+    local superuser="admin"
+
+    mkdir -p "$log_dir"
+    echo "[INFO] Token generation started at ${timestamp}" | tee -a "$log_file"
+
+    # Check for existing tokens (idempotency)
+    if [[ -f "$secrets_file" ]]; then
+        source "$secrets_file"
+
+        if [[ -n "$NETBOX_API_TOKEN_RW" && -n "$NETBOX_API_TOKEN_RO" ]]; then
+            echo "[INFO] Existing tokens detected. Skipping regeneration." | tee -a "$log_file"
+            echo "[INFO] RW token length: ${#NETBOX_API_TOKEN_RW}" | tee -a "$log_file"
+            echo "[INFO] RO token length: ${#NETBOX_API_TOKEN_RO}" | tee -a "$log_file"
+            return 0
+        else
+            echo "[WARN] Secrets file exists but tokens are missing or empty." | tee -a "$log_file"
+        fi
+    else
+        echo "[WARN] Secrets file not found. Creating new one." | tee -a "$log_file"
+    fi
+
+    echo "[INFO] Generating new NetBox API tokens..." | tee -a "$log_file"
+
+    # Ensure container is running
+    if ! docker ps --format '{{.Names}}' | grep -q "^${container}$"; then
+        echo "[ERROR] NetBox container '${container}' is not running." | tee -a "$log_file"
+        return 1
+    fi
+
+    # Generate RW token
+    local token_rw
+    token_rw=$(docker exec -u root "${container}" \
+        python3 /opt/netbox/netbox/manage.py tokens create "${superuser}" --write-enabled \
+        | awk '/Key:/ {print $2}')
+
+    if [[ -z "$token_rw" ]]; then
+        echo "[ERROR] Failed to generate RW token." | tee -a "$log_file"
+        return 1
+    fi
+    echo "[INFO] RW token generated." | tee -a "$log_file"
+
+    # Generate RO token
+    local token_ro
+    token_ro=$(docker exec -u root "${container}" \
+        python3 /opt/netbox/netbox/manage.py tokens create "${superuser}" \
+        | awk '/Key:/ {print $2}')
+
+    if [[ -z "$token_ro" ]]; then
+        echo "[ERROR] Failed to generate RO token." | tee -a "$log_file"
+        return 1
+    fi
+    echo "[INFO] RO token generated." | tee -a "$log_file"
+
+    # Write tokens to secrets file
+    mkdir -p "$(dirname "$secrets_file")"
+    {
+        echo "NETBOX_API_TOKEN_RW=${token_rw}"
+        echo "NETBOX_API_TOKEN_RO=${token_ro}"
+    } > "$secrets_file"
+
+    chmod 600 "$secrets_file"
+    echo "[INFO] Tokens written to ${secrets_file}" | tee -a "$log_file"
+
+    # Verification
+    source "$secrets_file"
+    if [[ -n "$NETBOX_API_TOKEN_RW" && -n "$NETBOX_API_TOKEN_RO" ]]; then
+        echo "[INFO] Token verification successful." | tee -a "$log_file"
+    else
+        echo "[ERROR] Token verification failed." | tee -a "$log_file"
+        return 1
+    fi
+
+    echo "[INFO] Token generation completed successfully." | tee -a "$log_file"
+    return 0
+}
 
 ########################################
 # TOKEN VALIDATION
@@ -423,7 +510,7 @@ discovery_apply_full() {
 
 
 # ------------------------------------------------------------
-# End 1.9.14 additions
+# End 1.9.15 additions
 # ------------------------------------------------------------
 
 # ------------------------------------------------------------
@@ -1178,7 +1265,6 @@ install_or_update_stack() {
   generate_netbox_env
   generate_netdisco_env
   ensure_netdisco_deployment_yml
-  with_netbox_rw netbox_ensure_tokens
   
   if [[ ! -f netbox-custom/config/plugins.py ]]; then
     write_plugins_py_disabled
@@ -1200,6 +1286,8 @@ install_or_update_stack() {
 
   wait_for_http "NetBox" "http://localhost:${NETBOX_PORT}" 300
   wait_for_http "Netdisco" "http://localhost:${NETDISCO_PORT}" 300
+  generate_netbox_tokens
+  with_netbox_rw netbox_ensure_tokens
   log "All services operational"
 }
 
