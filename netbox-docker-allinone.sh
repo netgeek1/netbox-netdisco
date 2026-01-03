@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # NetBox Docker All-in-One Installer & Manager (+ Discovery + Plugins)
-# Version: 1.9.15
+# Version: 1.9.16
 # Baseline: v1.2.8 (LOCKED)
 # ============================================================
 # v1.3.x features (kept intact):
@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.9.15"
+SCRIPT_VERSION="1.9.16"
 
 # Script identity (helps detect running the wrong file/version)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -46,7 +46,7 @@ fi
 REAL_USER="${SUDO_USER:-root}"
 
 # ------------------------------------------------------------
-# Begin 1.9.15 additions
+# Begin 1.9.16 additions
 # ------------------------------------------------------------
 ### =================================================
 ### BEGIN - NETBOX AUTH / TOKEN / PRIVILEGE FRAMEWORK
@@ -510,7 +510,7 @@ discovery_apply_full() {
 
 
 # ------------------------------------------------------------
-# End 1.9.15 additions
+# End 1.9.16 additions
 # ------------------------------------------------------------
 
 # ------------------------------------------------------------
@@ -1187,21 +1187,26 @@ EOF
 }
 
 # ------------------------------------------------------------
-# Netdisco DB init (IDEMPOTENT)
+# Netdisco DB init (IDEMPOTENT + POSTGRES-SAFE)
 # ------------------------------------------------------------
 init_netdisco_db() {
   cd_install_dir
   log "Ensuring Netdisco database exists"
-  as_user docker compose exec -T postgres psql -U netbox -v ON_ERROR_STOP=1 <<'SQL'
-DO
-$$
-BEGIN
-  IF NOT EXISTS (SELECT FROM pg_database WHERE datname = 'netdisco') THEN
-    CREATE DATABASE netdisco;
-  END IF;
-END
-$$;
-SQL
+
+  # Check if DB exists
+  local exists
+  exists="$(as_user docker compose exec -T postgres \
+      psql -U netbox -tAc "SELECT 1 FROM pg_database WHERE datname='netdisco';" || true)"
+
+  if [[ "$exists" == "1" ]]; then
+    log "Netdisco database already exists"
+  else
+    log "Creating Netdisco database..."
+    as_user docker compose exec -T postgres \
+      psql -U netbox -v ON_ERROR_STOP=1 \
+      -c "CREATE DATABASE netdisco;"
+    log "Netdisco database created"
+  fi
 
   log "Initializing / verifying Netdisco schema"
   as_user docker compose exec netdisco-backend \
