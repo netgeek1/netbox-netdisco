@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # NetBox Docker All-in-One Installer & Manager (+ Discovery + Plugins)
-# Version: 1.9.12
+# Version: 1.9.13
 # Baseline: v1.2.8 (LOCKED)
 # ============================================================
 # v1.3.x features (kept intact):
@@ -30,31 +30,156 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.9.12"
+SCRIPT_VERSION="1.9.13"
 
 # Script identity (helps detect running the wrong file/version)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_BASENAME="$(basename "$SCRIPT_PATH")"
 
-# Script identity (prevents running an older copy by accident)
-SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
-SCRIPT_BASENAME="$(basename "$SCRIPT_PATH")"
+# ------------------------------------------------------------
+# Begin 1.9.13 additions
+# ------------------------------------------------------------
+### =================================================
+### BEGIN - NETBOX AUTH / TOKEN / PRIVILEGE FRAMEWORK
+### =================================================
 
-# ------------------------------------------------------------
-# Begin 1.9.12 additions
-# ------------------------------------------------------------
+########################################
+# ENV AUTOLOAD (authoritative)
+########################################
+NETBOX_ENV="/opt/netbox/.env"
+if [[ -f "$NETBOX_ENV" ]]; then
+  set -a
+  source "$NETBOX_ENV"
+  set +a
+fi
+
+########################################
+# REQUIRED BASE SETTINGS
+########################################
+: "${NETBOX_API:=http://localhost:8000/api}"
+
+########################################
+# TOKEN ENFORCEMENT MODES
+########################################
+# Modes:
+#   RO  = read-only discovery / diff
+#   RW  = write / apply / reconcile
+########################################
+
+########################################
+# TOKEN VALIDATION
+########################################
+netbox_validate_token() {
+  local mode="$1"
+  local token_var
+
+  case "$mode" in
+    RO) token_var="NETBOX_API_TOKEN_RO" ;;
+    RW) token_var="NETBOX_API_TOKEN_RW" ;;
+    *)
+      echo "[FATAL] Invalid token mode: $mode"
+      exit 1
+      ;;
+  esac
+
+  if [[ -z "${!token_var:-}" ]]; then
+    echo "[ERROR] Required NetBox token missing: $token_var"
+    exit 1
+  fi
+
+  export NETBOX_TOKEN="${!token_var}"
+}
+
+########################################
+# NETBOX API WRAPPER (PRIVILEGE AWARE)
+########################################
+netbox_api() {
+  local method="$1" endpoint="$2" data="$3"
+
+  curl -fsS -X "$method" \
+    -H "Authorization: Token $NETBOX_TOKEN" \
+    -H "Content-Type: application/json" \
+    ${data:+-d "$data"} \
+    "$NETBOX_API/$endpoint"
+}
+
+########################################
+# TOKEN AUTO-GENERATION (ADMIN ONLY)
+########################################
+netbox_generate_token() {
+  local name="$1"
+  local write="$2"   # true | false
+
+  netbox_validate_token RW
+
+  local payload
+  if [[ "$write" == "true" ]]; then
+    payload='{"name":"'"$name"'","write_enabled":true}'
+  else
+    payload='{"name":"'"$name"'","write_enabled":false}'
+  fi
+
+  netbox_api POST "users/tokens/" "$payload" | jq -r '.key'
+}
+
+########################################
+# AUTO-ENSURE TOKENS (IDEMPOTENT)
+########################################
+netbox_ensure_tokens() {
+  netbox_validate_token RW
+
+  if [[ -z "${NETBOX_API_TOKEN_RO:-}" ]]; then
+    echo "[INFO] Creating read-only NetBox token"
+    NETBOX_API_TOKEN_RO="$(netbox_generate_token discovery-ro false)"
+    echo "NETBOX_API_TOKEN_RO=$NETBOX_API_TOKEN_RO" >> "$NETBOX_ENV"
+  fi
+
+  if [[ -z "${NETBOX_API_TOKEN_RW:-}" ]]; then
+    echo "[INFO] Creating read-write NetBox token"
+    NETBOX_API_TOKEN_RW="$(netbox_generate_token discovery-rw true)"
+    echo "NETBOX_API_TOKEN_RW=$NETBOX_API_TOKEN_RW" >> "$NETBOX_ENV"
+  fi
+}
+
+########################################
+# PRIVILEGE SEPARATED EXECUTION HELPERS
+########################################
+with_netbox_ro() {
+  netbox_validate_token RO
+  "$@"
+}
+
+with_netbox_rw() {
+  netbox_validate_token RW
+  "$@"
+}
+
+### =================================================
+### END - NETBOX AUTH / TOKEN / PRIVILEGE FRAMEWORK
+### =================================================
+
+### --- Constants ---
 NETBOX_API="${NETBOX_API:-http://localhost:8000/api}"
-NETBOX_TOKEN="${NETBOX_API_TOKEN}"
+
+### # --- NetBox API token (required) ---
+### if [[ -z "${NETBOX_API_TOKEN:-}" ]]; then
+###   echo "[ERROR] NETBOX_API_TOKEN is not set."
+###   echo "Set it in /opt/netbox/.env or export it before running discovery."
+###   return 1 2>/dev/null || exit 1
+### fi
+
+### NETBOX_TOKEN="$NETBOX_API_TOKEN"
 DISCOVERY_DIR="/opt/netbox/discovery"
 SCAN_JSON="$DISCOVERY_DIR/scan.json"
 NORM_JSON="$DISCOVERY_DIR/normalized.json"
+SNMP_JSON="$DISCOVERY_DIR/snmp.json"
 AUDIT_LOG="$DISCOVERY_DIR/audit.log"
 
-netbox_api() {
-  local method="$1"
-  local endpoint="$2"
-  local data="${3:-}"
+mkdir -p "$DISCOVERY_DIR"
 
+### --- NetBox API wrapper ---
+netbox_api() {
+  local method="$1" endpoint="$2" data="$3"
   curl -sS -X "$method" \
     -H "Authorization: Token $NETBOX_TOKEN" \
     -H "Content-Type: application/json" \
@@ -62,119 +187,242 @@ netbox_api() {
     "$NETBOX_API/$endpoint"
 }
 
-discovery_scan_nmap() {
-  mkdir -p "$DISCOVERY_DIR"
+### --- CIDR Discovery (Nmap) ---
+discovery_scan_cidr() {
   : > "$AUDIT_LOG"
-
-  echo "[INFO] Starting Nmap discovery" | tee -a "$AUDIT_LOG"
-
-  nmap -sn -oX - "$@" | \
-    python3 - <<'PY'
-import sys, json, xml.etree.ElementTree as ET
+  nmap -sn "$1" -oX - | python3 - <<'PY' > "$SCAN_JSON"
+import xml.etree.ElementTree as ET, json, sys
 root = ET.fromstring(sys.stdin.read())
-hosts = []
-
+hosts=[]
 for h in root.findall("host"):
-    addr = h.find("address[@addrtype='ipv4']")
-    if addr is None:
-        continue
-    hostname = h.find("hostnames/hostname")
+    a=h.find("address[@addrtype='ipv4']")
+    if a is None: continue
+    hn=h.find("hostnames/hostname")
     hosts.append({
-        "ip": addr.get("addr"),
-        "hostname": hostname.get("name") if hostname is not None else None
+        "ip":a.get("addr"),
+        "name":hn.get("name") if hn is not None else None
     })
-
-print(json.dumps(hosts, indent=2))
-PY > "$SCAN_JSON"
-
-  echo "[INFO] Scan complete: $(jq length "$SCAN_JSON") hosts found" | tee -a "$AUDIT_LOG"
+print(json.dumps(hosts,indent=2))
+PY
 }
 
+### --- Normalize ---
 discovery_normalize() {
-  echo "[INFO] Normalizing discovery data" | tee -a "$AUDIT_LOG"
-
   jq '
   map({
-    name: (.hostname // ("host-" + (.ip | gsub("\\."; "-")))),
-    mgmt_ip: .ip,
-    site: "default",
-    role: "unknown",
-    device_type: "generic"
-  })
-  ' "$SCAN_JSON" > "$NORM_JSON"
-
-  echo "[INFO] Normalization complete" | tee -a "$AUDIT_LOG"
+    name:(.name // ("host-" + (.ip|gsub("\\."; "-")))),
+    ip:.ip,
+    site:"default",
+    role:"unknown",
+    type:"generic"
+  })' "$SCAN_JSON" > "$NORM_JSON"
 }
 
-netbox_ensure_site() {
-  local site="$1"
-  netbox_api GET "dcim/sites/?name=$site" | jq -e '.count>0' >/dev/null \
-    || netbox_api POST "dcim/sites/" "{\"name\":\"$site\",\"slug\":\"$site\"}"
+### --- Ensure primitives ---
+netbox_ensure() {
+  local ep="$1" name="$2" payload="$3"
+  netbox_api GET "$ep/?name=$name" | jq -e '.count>0' >/dev/null || \
+    netbox_api POST "$ep/" "$payload" >/dev/null
 }
 
-netbox_ensure_role() {
-  local role="$1"
-  netbox_api GET "dcim/device-roles/?name=$role" | jq -e '.count>0' >/dev/null \
-    || netbox_api POST "dcim/device-roles/" "{\"name\":\"$role\",\"slug\":\"$role\"}"
-}
-
-netbox_ensure_devicetype() {
-  local dtype="$1"
-  netbox_api GET "dcim/device-types/?model=$dtype" | jq -e '.count>0' >/dev/null \
-    || netbox_api POST "dcim/device-types/" "{\"model\":\"$dtype\",\"slug\":\"$dtype\",\"manufacturer\":1}"
-}
-
+### --- Device import ---
 discovery_import_devices() {
-  echo "[INFO] Importing devices into NetBox" | tee -a "$AUDIT_LOG"
+  jq -c '.[]' "$NORM_JSON" | while read -r d; do
+    name=$(jq -r .name <<<"$d")
+    ip=$(jq -r .ip <<<"$d")
 
-  jq -c '.[]' "$NORM_JSON" | while read -r dev; do
-    name=$(jq -r '.name' <<<"$dev")
-    ip=$(jq -r '.mgmt_ip' <<<"$dev")
-    site=$(jq -r '.site' <<<"$dev")
-    role=$(jq -r '.role' <<<"$dev")
-    dtype=$(jq -r '.device_type' <<<"$dev")
+    netbox_ensure "dcim/sites" default '{"name":"default","slug":"default"}'
+    netbox_ensure "dcim/device-roles" unknown '{"name":"unknown","slug":"unknown"}'
+    netbox_ensure "dcim/device-types" generic '{"model":"generic","slug":"generic","manufacturer":1}'
 
-    netbox_ensure_site "$site"
-    netbox_ensure_role "$role"
-    netbox_ensure_devicetype "$dtype"
+    dev_id=$(netbox_api GET "dcim/devices/?name=$name" | jq -r '.results[0].id//empty')
 
-    device_id=$(netbox_api GET "dcim/devices/?name=$name" | jq -r '.results[0].id // empty')
-
-    if [[ -z "$device_id" ]]; then
-      device_id=$(netbox_api POST "dcim/devices/" "{
+    if [[ -z "$dev_id" ]]; then
+      dev_id=$(netbox_api POST "dcim/devices/" "{
         \"name\":\"$name\",
         \"site\":1,
         \"device_role\":1,
         \"device_type\":1,
         \"status\":\"active\"
-      }" | jq -r '.id')
-
-      echo "[ADD] Device $name" | tee -a "$AUDIT_LOG"
-    else
-      echo "[SKIP] Device $name exists" | tee -a "$AUDIT_LOG"
+      }" | jq -r .id)
+      echo "[ADD] $name" >> "$AUDIT_LOG"
     fi
 
     netbox_api POST "ipam/ip-addresses/" "{
       \"address\":\"$ip/32\",
       \"assigned_object_type\":\"dcim.device\",
-      \"assigned_object_id\":$device_id
+      \"assigned_object_id\":$dev_id
     }" >/dev/null 2>&1 || true
   done
 }
 
-discovery_apply() {
-  echo "[INFO] === APPLY DISCOVERY ===" | tee -a "$AUDIT_LOG"
-
-  [[ -f "$SCAN_JSON" ]] || { echo "[ERROR] scan.json missing"; return 1; }
-
-  discovery_normalize
-  discovery_import_devices
-
-  echo "[INFO] Apply complete" | tee -a "$AUDIT_LOG"
+### --- SNMP Interface Discovery ---
+discovery_snmp_interfaces() {
+  jq -r '.[].ip' "$NORM_JSON" | while read -r ip; do
+    snmpwalk -On -v2c -c public "$ip" IF-MIB::ifDescr 2>/dev/null | \
+    awk -F': ' '{print $2}' | while read -r iface; do
+      echo "$ip|$iface"
+    done
+  done | jq -R 'split("|")|{ip:.[0],iface:.[1]}' | jq -s '.' > "$SNMP_JSON"
 }
 
+### --- Interface import ---
+discovery_import_interfaces() {
+  jq -c '.[]' "$SNMP_JSON" | while read -r i; do
+    ip=$(jq -r .ip <<<"$i")
+    iface=$(jq -r .iface <<<"$i")
+
+    dev_id=$(netbox_api GET "dcim/devices/?q=$ip" | jq -r '.results[0].id//empty')
+    [[ -z "$dev_id" ]] && continue
+
+    netbox_api POST "dcim/interfaces/" "{
+      \"device\":$dev_id,
+      \"name\":\"$iface\",
+      \"type\":\"other\"
+    }" >/dev/null 2>&1 || true
+  done
+}
+
+### --- Apply (authoritative) ---
+discovery_apply() {
+  discovery_normalize
+  discovery_import_devices
+  discovery_snmp_interfaces
+  discovery_import_interfaces
+  echo "[DONE] Discovery applied" >> "$AUDIT_LOG"
+}
+
+### ==================================
+### BEGIN - ADVANCED DISCOVERY LAYERS
+### ==================================
+
+### --- Files ---
+DIFF_JSON="$DISCOVERY_DIR/diff.json"
+NEIGHBOR_JSON="$DISCOVERY_DIR/neighbors.json"
+RECON_LOG="$DISCOVERY_DIR/reconcile.log"
+
+### --- Netdisco API helper ---
+netdisco_api() {
+  curl -sS "http://localhost:5000/api/v1/$1"
+}
+
+### ==================================================
+### LLDP / CDP NEIGHBOR DISCOVERY (via Netdisco)
+### ==================================================
+discovery_neighbors() {
+  netdisco_api "search/device?field=ip&op=~&value=." | \
+  jq -r '.devices[].ip' | while read -r ip; do
+    netdisco_api "object/device/$ip/neighbor" | \
+    jq -c '.neighbors[]?' | while read -r n; do
+      jq -n --arg src "$ip" --argjson n "$n" '
+        {
+          src_ip:$src,
+          local_port:$n.port,
+          remote_name:$n.remote_name,
+          remote_port:$n.remote_port
+        }'
+    done
+  done | jq -s '.' > "$NEIGHBOR_JSON"
+}
+
+### --- Import neighbors ---
+discovery_import_neighbors() {
+  jq -c '.[]' "$NEIGHBOR_JSON" | while read -r n; do
+    src=$(jq -r .src_ip <<<"$n")
+    lport=$(jq -r .local_port <<<"$n")
+    rname=$(jq -r .remote_name <<<"$n")
+    rport=$(jq -r .remote_port <<<"$n")
+
+    src_id=$(netbox_api GET "dcim/devices/?q=$src" | jq -r '.results[0].id//empty')
+    dst_id=$(netbox_api GET "dcim/devices/?name=$rname" | jq -r '.results[0].id//empty')
+    [[ -z "$src_id" || -z "$dst_id" ]] && continue
+
+    li=$(netbox_api GET "dcim/interfaces/?device_id=$src_id&name=$lport" | jq -r '.results[0].id//empty')
+    ri=$(netbox_api GET "dcim/interfaces/?device_id=$dst_id&name=$rport" | jq -r '.results[0].id//empty')
+    [[ -z "$li" || -z "$ri" ]] && continue
+
+    netbox_api POST "dcim/cables/" "{
+      \"a_terminations\":[{\"object_type\":\"dcim.interface\",\"object_id\":$li}],
+      \"b_terminations\":[{\"object_type\":\"dcim.interface\",\"object_id\":$ri}]
+    }" >/dev/null 2>&1 || true
+  done
+}
+
+### ==================================================
+### DIFF-BEFORE-APPLY
+### ==================================================
+discovery_diff() {
+  netbox_api GET "dcim/devices/?limit=10000" | \
+  jq '[.results[].name]' > "$DISCOVERY_DIR/netbox_devices.json"
+
+  jq '[.[].name]' "$NORM_JSON" > "$DISCOVERY_DIR/discovered_devices.json"
+
+  jq -n '
+    {
+      add: (input[1] - input[0]),
+      remove: (input[0] - input[1])
+    }' \
+    "$DISCOVERY_DIR/netbox_devices.json" \
+    "$DISCOVERY_DIR/discovered_devices.json" \
+    > "$DIFF_JSON"
+}
+
+### ==================================================
+### DELETE RECONCILIATION (SAFE)
+### ==================================================
+discovery_reconcile_delete() {
+  jq -r '.remove[]' "$DIFF_JSON" | while read -r name; do
+    id=$(netbox_api GET "dcim/devices/?name=$name" | jq -r '.results[0].id//empty')
+    [[ -z "$id" ]] && continue
+    netbox_api PATCH "dcim/devices/$id/" '{"status":"offline"}' >/dev/null
+    echo "[OFFLINE] $name" >> "$RECON_LOG"
+  done
+}
+
+### ==================================================
+### NETDISCO → NETBOX ENRICHMENT
+### ==================================================
+discovery_enrich_from_netdisco() {
+  netdisco_api "search/device?field=ip&op=~&value=." | \
+  jq -c '.devices[]' | while read -r d; do
+    ip=$(jq -r .ip <<<"$d")
+    model=$(jq -r .model <<<"$d")
+    os=$(jq -r .os <<<"$d")
+    vendor=$(jq -r .vendor <<<"$d")
+
+    id=$(netbox_api GET "dcim/devices/?q=$ip" | jq -r '.results[0].id//empty')
+    [[ -z "$id" ]] && continue
+
+    netbox_api PATCH "dcim/devices/$id/" "{
+      \"custom_fields\":{
+        \"model\":\"$model\",
+        \"os\":\"$os\",
+        \"vendor\":\"$vendor\"
+      }
+    }" >/dev/null
+  done
+}
+
+### ==================================================
+### FULL APPLY (EXTENDED)
+### ==================================================
+discovery_apply_full() {
+  discovery_diff
+  discovery_apply
+  discovery_neighbors
+  discovery_import_neighbors
+  discovery_reconcile_delete
+  discovery_enrich_from_netdisco
+  echo "[DONE] Full discovery + reconciliation applied" >> "$AUDIT_LOG"
+}
+
+### ==================================
+### END - ADVANCED DISCOVERY LAYERS
+### ==================================
+
+
 # ------------------------------------------------------------
-# End 1.9.12 additions
+# End 1.9.13 additions
 # ------------------------------------------------------------
 
 # ------------------------------------------------------------
@@ -2062,7 +2310,7 @@ echo "08) Netdisco: Change admin password (UI guidance)"
     01|1) install_or_update_stack ; pause ;;
     02|2) start_stack ; pause ;;
     03|3) stop_stack ; pause ;;
-    04|4) restart_stackv ;;
+    04|4) restart_stack ; pause ;;
     05|5) status_stack ; pause ;;
     06|6) logs_stack ; pause ;;
 
