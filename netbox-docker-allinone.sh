@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # NetBox Docker All-in-One Installer & Manager (+ Discovery + Plugins)
-# Version: 1.3.4
+# Version: 1.9.12
 # Baseline: v1.2.8 (LOCKED)
 # ============================================================
 # v1.3.x features (kept intact):
@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.9.11"
+SCRIPT_VERSION="1.9.12"
 
 # Script identity (helps detect running the wrong file/version)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -39,6 +39,143 @@ SCRIPT_BASENAME="$(basename "$SCRIPT_PATH")"
 # Script identity (prevents running an older copy by accident)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_BASENAME="$(basename "$SCRIPT_PATH")"
+
+# ------------------------------------------------------------
+# Begin 1.9.12 additions
+# ------------------------------------------------------------
+NETBOX_API="${NETBOX_API:-http://localhost:8000/api}"
+NETBOX_TOKEN="${NETBOX_API_TOKEN}"
+DISCOVERY_DIR="/opt/netbox/discovery"
+SCAN_JSON="$DISCOVERY_DIR/scan.json"
+NORM_JSON="$DISCOVERY_DIR/normalized.json"
+AUDIT_LOG="$DISCOVERY_DIR/audit.log"
+
+netbox_api() {
+  local method="$1"
+  local endpoint="$2"
+  local data="${3:-}"
+
+  curl -sS -X "$method" \
+    -H "Authorization: Token $NETBOX_TOKEN" \
+    -H "Content-Type: application/json" \
+    ${data:+-d "$data"} \
+    "$NETBOX_API/$endpoint"
+}
+
+discovery_scan_nmap() {
+  mkdir -p "$DISCOVERY_DIR"
+  : > "$AUDIT_LOG"
+
+  echo "[INFO] Starting Nmap discovery" | tee -a "$AUDIT_LOG"
+
+  nmap -sn -oX - "$@" | \
+    python3 - <<'PY'
+import sys, json, xml.etree.ElementTree as ET
+root = ET.fromstring(sys.stdin.read())
+hosts = []
+
+for h in root.findall("host"):
+    addr = h.find("address[@addrtype='ipv4']")
+    if addr is None:
+        continue
+    hostname = h.find("hostnames/hostname")
+    hosts.append({
+        "ip": addr.get("addr"),
+        "hostname": hostname.get("name") if hostname is not None else None
+    })
+
+print(json.dumps(hosts, indent=2))
+PY > "$SCAN_JSON"
+
+  echo "[INFO] Scan complete: $(jq length "$SCAN_JSON") hosts found" | tee -a "$AUDIT_LOG"
+}
+
+discovery_normalize() {
+  echo "[INFO] Normalizing discovery data" | tee -a "$AUDIT_LOG"
+
+  jq '
+  map({
+    name: (.hostname // ("host-" + (.ip | gsub("\\."; "-")))),
+    mgmt_ip: .ip,
+    site: "default",
+    role: "unknown",
+    device_type: "generic"
+  })
+  ' "$SCAN_JSON" > "$NORM_JSON"
+
+  echo "[INFO] Normalization complete" | tee -a "$AUDIT_LOG"
+}
+
+netbox_ensure_site() {
+  local site="$1"
+  netbox_api GET "dcim/sites/?name=$site" | jq -e '.count>0' >/dev/null \
+    || netbox_api POST "dcim/sites/" "{\"name\":\"$site\",\"slug\":\"$site\"}"
+}
+
+netbox_ensure_role() {
+  local role="$1"
+  netbox_api GET "dcim/device-roles/?name=$role" | jq -e '.count>0' >/dev/null \
+    || netbox_api POST "dcim/device-roles/" "{\"name\":\"$role\",\"slug\":\"$role\"}"
+}
+
+netbox_ensure_devicetype() {
+  local dtype="$1"
+  netbox_api GET "dcim/device-types/?model=$dtype" | jq -e '.count>0' >/dev/null \
+    || netbox_api POST "dcim/device-types/" "{\"model\":\"$dtype\",\"slug\":\"$dtype\",\"manufacturer\":1}"
+}
+
+discovery_import_devices() {
+  echo "[INFO] Importing devices into NetBox" | tee -a "$AUDIT_LOG"
+
+  jq -c '.[]' "$NORM_JSON" | while read -r dev; do
+    name=$(jq -r '.name' <<<"$dev")
+    ip=$(jq -r '.mgmt_ip' <<<"$dev")
+    site=$(jq -r '.site' <<<"$dev")
+    role=$(jq -r '.role' <<<"$dev")
+    dtype=$(jq -r '.device_type' <<<"$dev")
+
+    netbox_ensure_site "$site"
+    netbox_ensure_role "$role"
+    netbox_ensure_devicetype "$dtype"
+
+    device_id=$(netbox_api GET "dcim/devices/?name=$name" | jq -r '.results[0].id // empty')
+
+    if [[ -z "$device_id" ]]; then
+      device_id=$(netbox_api POST "dcim/devices/" "{
+        \"name\":\"$name\",
+        \"site\":1,
+        \"device_role\":1,
+        \"device_type\":1,
+        \"status\":\"active\"
+      }" | jq -r '.id')
+
+      echo "[ADD] Device $name" | tee -a "$AUDIT_LOG"
+    else
+      echo "[SKIP] Device $name exists" | tee -a "$AUDIT_LOG"
+    fi
+
+    netbox_api POST "ipam/ip-addresses/" "{
+      \"address\":\"$ip/32\",
+      \"assigned_object_type\":\"dcim.device\",
+      \"assigned_object_id\":$device_id
+    }" >/dev/null 2>&1 || true
+  done
+}
+
+discovery_apply() {
+  echo "[INFO] === APPLY DISCOVERY ===" | tee -a "$AUDIT_LOG"
+
+  [[ -f "$SCAN_JSON" ]] || { echo "[ERROR] scan.json missing"; return 1; }
+
+  discovery_normalize
+  discovery_import_devices
+
+  echo "[INFO] Apply complete" | tee -a "$AUDIT_LOG"
+}
+
+# ------------------------------------------------------------
+# End 1.9.12 additions
+# ------------------------------------------------------------
 
 # ------------------------------------------------------------
 # SNMP Debug Logging (host-side)
@@ -1807,124 +1944,6 @@ PY
   fi
 }
 
-
-
-
-
-menu_main() {
-  clear
-  echo "======================================"
-  echo " ${SCRIPT_NAME} (v${SCRIPT_VERSION})"
-  echo "======================================"
-  echo "Install dir: ${INSTALL_DIR:-<not set>}"
-  if [[ -n "${SCRIPT_BASENAME:-}" && -n "${SCRIPT_PATH:-}" ]]; then
-    echo "Script: ${SCRIPT_BASENAME} (${SCRIPT_PATH})"
-  fi
-  echo "--------------------------------------"
-  echo "01) Install / Update stack (NetBox + Netdisco)"
-  echo "02) Start stack"
-  echo "03) Stop stack"
-  echo "04) Restart stack"
-  echo "05) Status"
-  echo "06) View ALL logs"
-echo "07) Change NetBox admin password"
-echo "08) Netdisco: Change admin password (UI guidance)"
-  echo "09) Netdisco: EMERGENCY admin password reset (UNSUPPORTED)"
-  echo "--------------------------------------"
-  echo "10) Netdisco: SNMP & credential guidance (UI hint)"
-  echo "--------------------------------------"
-  echo "20) SNMP Credentials: List (RO)"
-  echo "21) SNMP Credentials: Add"
-  echo "22) SNMP Credentials: Change"
-  echo "23) SNMP Credentials: Delete"
-  echo "24) SNMP Credentials: Reorder priority"
-  echo "25) SNMP Credentials: Test credential"
-  echo "--------------------------------------"
-  echo "30) NetBox plugins: Status"
-  echo "31) NetBox plugins: Enable (Topology Views + BGP)"
-  echo "32) NetBox plugins: Disable (revert to stock)"
-  echo "--------------------------------------"
-  echo "40) Discovery: Status / Enabled sources"
-  echo "41) Discovery: Toggle sources"
-  echo "42) Discovery: Dry-run (validation only)"
-  echo "43) Discovery: Apply approved changes"
-  echo "44) Discovery: View last discovery report"
-  echo "--------------------------------------"
-  echo "50) Debug: View SNMP debug log"
-  echo "51) Debug: View SNMP proof markers"
-  echo "--------------------------------------"
-  echo "99) Exit (Q/q)"
-  echo "======================================"
-  read -rp "Select option: " SEL
-
-  case "$SEL" in
-    01|1) install_or_update_stack ;;
-    02|2) start_stack ;;
-    03|3) stop_stack ;;
-    04|4) restart_stack ;;
-    05|5) status_stack ;;
-    06|6) logs_stack ;;
-
-    07|7) change_netbox_admin_password ; pause ;;
-    08|8) netdisco_password_ui_guidance ;;
-
-    09|9) netdisco_password_emergency_reset ;;
-
-    10) show_netdisco_credential_ui_hint ;;
-
-    20) snmp_credentials_list ; pause ;;
-    21) snmp_credentials_add ; pause ;;
-    22) snmp_credentials_change ; pause ;;
-    23) snmp_credentials_delete ; pause ;;
-    24) snmp_credentials_move ; pause ;;
-    25) snmp_credentials_test ; pause ;;
-
-    30) plugin_status ;;
-    31) enable_netbox_plugins ;;
-    32) disable_netbox_plugins ;;
-
-    40) discovery_status ; pause ;;
-    41) discovery_toggle_menu ;;
-    42) discovery_dry_run_all ; pause ;;
-    43) discovery_apply_all ; pause ;;
-    44) discovery_view_last_report ; pause ;;
-
-    50) view_snmp_debug_log ; pause ;;
-    51) view_snmp_proof_markers ; pause ;;
-
-    99|Q|q) echo "Bye."; exit 0 ;;
-    *) echo "Invalid option"; pause ;;
-  esac
-}
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
-init_runtime() {
-  log_script_identity
-  # Extracted init sequence (previously inline)
-  install_docker
-  ensure_docker_group
-  ensure_install_dir
-}
-
-# ------------------------------------------------------------
-# Execution (v1.9.0): single runnable menu loop only
-# ------------------------------------------------------------
-main() {
-  init_runtime
-  while true; do
-    menu_main
-  done
-}
-
-main "$@"
-
-
-
-
-
-
-
 netdisco_password_ui_guidance() {
   echo "======================================"
   echo " Netdisco Password Management"
@@ -1989,3 +2008,114 @@ EOF
   echo "[INFO] Emergency reset workflow completed."
   pause
 }
+
+
+
+
+menu_main() {
+  clear
+  echo "======================================"
+  echo " ${SCRIPT_NAME} (v${SCRIPT_VERSION})"
+  echo "======================================"
+  echo "Install dir: ${INSTALL_DIR:-<not set>}"
+  if [[ -n "${SCRIPT_BASENAME:-}" && -n "${SCRIPT_PATH:-}" ]]; then
+    echo "Script: ${SCRIPT_BASENAME} (${SCRIPT_PATH})"
+  fi
+  echo "--------------------------------------"
+  echo "01) Install / Update stack (NetBox + Netdisco)"
+  echo "02) Start stack"
+  echo "03) Stop stack"
+  echo "04) Restart stack"
+  echo "05) Status"
+  echo "06) View ALL logs"
+echo "07) Change NetBox admin password"
+echo "08) Netdisco: Change admin password (UI guidance)"
+  echo "09) Netdisco: EMERGENCY admin password reset (UNSUPPORTED)"
+  echo "--------------------------------------"
+  echo "10) Netdisco: SNMP & credential guidance (UI hint)"
+  echo "--------------------------------------"
+  echo "20) SNMP Credentials: List (RO)"
+  echo "21) SNMP Credentials: Add"
+  echo "22) SNMP Credentials: Change"
+  echo "23) SNMP Credentials: Delete"
+  echo "24) SNMP Credentials: Reorder priority"
+  echo "25) SNMP Credentials: Test credential"
+  echo "--------------------------------------"
+  echo "30) NetBox plugins: Status"
+  echo "31) NetBox plugins: Enable (Topology Views + BGP)"
+  echo "32) NetBox plugins: Disable (revert to stock)"
+  echo "--------------------------------------"
+  echo "40) Discovery: Status / Enabled sources"
+  echo "41) Discovery: Toggle sources"
+  echo "42) Discovery: Dry-run (validation only)"
+  echo "43) Discovery: Apply approved changes"
+  echo "44) Discovery: View last discovery report"
+  echo "--------------------------------------"
+  echo "50) Debug: View SNMP debug log"
+  echo "51) Debug: View SNMP proof markers"
+  echo "--------------------------------------"
+  echo "99) Exit (Q/q)"
+  echo "======================================"
+  read -rp "Select option: " SEL
+
+  case "$SEL" in
+    01|1) install_or_update_stack ; pause ;;
+    02|2) start_stack ; pause ;;
+    03|3) stop_stack ; pause ;;
+    04|4) restart_stackv ;;
+    05|5) status_stack ; pause ;;
+    06|6) logs_stack ; pause ;;
+
+    07|7) change_netbox_admin_password ; pause ;;
+    08|8) netdisco_password_ui_guidance ; pause ;;
+
+    09|9) netdisco_password_emergency_reset ; pause ;;
+
+    10) show_netdisco_credential_ui_hint ; pause ;;
+
+    20) snmp_credentials_list ; pause ;;
+    21) snmp_credentials_add ; pause ;;
+    22) snmp_credentials_change ; pause ;;
+    23) snmp_credentials_delete ; pause ;;
+    24) snmp_credentials_move ; pause ;;
+    25) snmp_credentials_test ; pause ;;
+
+    30) plugin_status ; pause ;;
+    31) enable_netbox_plugins ; pause ;;
+    32) disable_netbox_plugins ; pause ;;
+
+    40) discovery_status ; pause ;;
+    41) discovery_toggle_menu ; pause ;;
+    42) discovery_dry_run_all ; pause ;;
+    43) discovery_apply_all ; pause ;;
+    44) discovery_view_last_report ; pause ;;
+
+    50) view_snmp_debug_log ; pause ;;
+    51) view_snmp_proof_markers ; pause ;;
+
+    99|Q|q) echo "Bye."; exit 0 ;;
+    *) echo "Invalid option"; pause ;;
+  esac
+}
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+init_runtime() {
+  log_script_identity
+  # Extracted init sequence (previously inline)
+  install_docker
+  ensure_docker_group
+  ensure_install_dir
+}
+
+# ------------------------------------------------------------
+# Execution (v1.9.0): single runnable menu loop only
+# ------------------------------------------------------------
+main() {
+  init_runtime
+  while true; do
+    menu_main
+  done
+}
+
+main "$@"
