@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # NetBox Docker All-in-One Installer & Manager (+ Discovery + Plugins)
-# Version: 1.9.13
+# Version: 1.9.14
 # Baseline: v1.2.8 (LOCKED)
 # ============================================================
 # v1.3.x features (kept intact):
@@ -30,14 +30,14 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.9.13"
+SCRIPT_VERSION="1.9.14"
 
 # Script identity (helps detect running the wrong file/version)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_BASENAME="$(basename "$SCRIPT_PATH")"
 
 # ------------------------------------------------------------
-# Begin 1.9.13 additions
+# Begin 1.9.14 additions
 # ------------------------------------------------------------
 ### =================================================
 ### BEGIN - NETBOX AUTH / TOKEN / PRIVILEGE FRAMEWORK
@@ -161,14 +161,6 @@ with_netbox_rw() {
 ### --- Constants ---
 NETBOX_API="${NETBOX_API:-http://localhost:8000/api}"
 
-### # --- NetBox API token (required) ---
-### if [[ -z "${NETBOX_API_TOKEN:-}" ]]; then
-###   echo "[ERROR] NETBOX_API_TOKEN is not set."
-###   echo "Set it in /opt/netbox/.env or export it before running discovery."
-###   return 1 2>/dev/null || exit 1
-### fi
-
-### NETBOX_TOKEN="$NETBOX_API_TOKEN"
 DISCOVERY_DIR="/opt/netbox/discovery"
 SCAN_JSON="$DISCOVERY_DIR/scan.json"
 NORM_JSON="$DISCOVERY_DIR/normalized.json"
@@ -422,7 +414,7 @@ discovery_apply_full() {
 
 
 # ------------------------------------------------------------
-# End 1.9.13 additions
+# End 1.9.14 additions
 # ------------------------------------------------------------
 
 # ------------------------------------------------------------
@@ -1177,7 +1169,8 @@ install_or_update_stack() {
   generate_netbox_env
   generate_netdisco_env
   ensure_netdisco_deployment_yml
-
+  with_netbox_rw netbox_ensure_tokens
+  
   if [[ ! -f netbox-custom/config/plugins.py ]]; then
     write_plugins_py_disabled
   fi
@@ -2298,6 +2291,7 @@ echo "08) Netdisco: Change admin password (UI guidance)"
   echo "42) Discovery: Dry-run (validation only)"
   echo "43) Discovery: Apply approved changes"
   echo "44) Discovery: View last discovery report"
+  echo "45) Discovery: Topology enrichment (LLDP / CDP)"
   echo "--------------------------------------"
   echo "50) Debug: View SNMP debug log"
   echo "51) Debug: View SNMP proof markers"
@@ -2332,11 +2326,12 @@ echo "08) Netdisco: Change admin password (UI guidance)"
     31) enable_netbox_plugins ; pause ;;
     32) disable_netbox_plugins ; pause ;;
 
-    40) discovery_status ; pause ;;
+    40) with_netbox_ro discovery_status ; pause ;;
     41) discovery_toggle_menu ; pause ;;
-    42) discovery_dry_run_all ; pause ;;
-    43) discovery_apply_all ; pause ;;
+    42) with_netbox_ro discovery_diff ; pause ;;
+    43) with_netbox_rw discovery_apply_full ; pause ;;
     44) discovery_view_last_report ; pause ;;
+    45) with_netbox_rw discovery_import_neighbors ; pause ;;
 
     50) view_snmp_debug_log ; pause ;;
     51) view_snmp_proof_markers ; pause ;;
