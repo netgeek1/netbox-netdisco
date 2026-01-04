@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # NetBox Docker All-in-One Installer & Manager (+ Discovery + Plugins)
-# Version: 1.9.16
+# Version: 1.9.17
 # Baseline: v1.2.8 (LOCKED)
 # ============================================================
 # v1.3.x features (kept intact):
@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.9.16"
+SCRIPT_VERSION="1.9.17"
 
 # Script identity (helps detect running the wrong file/version)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -46,17 +46,109 @@ fi
 REAL_USER="${SUDO_USER:-root}"
 
 # ------------------------------------------------------------
-# Begin 1.9.16 additions
+# Begin 1.9.17 additions
 # ------------------------------------------------------------
 ### =================================================
 ### BEGIN - NETBOX AUTH / TOKEN / PRIVILEGE FRAMEWORK
 ### =================================================
+# ------------------------------------------------------------
+# ENV VALIDATION + AUTO‑REPAIR + SAFE SECRET GENERATOR
+# ------------------------------------------------------------
+
+# Validate .env file for malformed or multiline entries
+validate_env_file() {
+  local env_file="/opt/netbox/.env"
+  log "Validating ${env_file}"
+
+  if [[ ! -f "$env_file" ]]; then
+    log "WARN: .env file does not exist"
+    return 1
+  fi
+
+  local bad_lines
+  bad_lines=$(awk '
+    /^[A-Za-z0-9_]+=.+$/ { next }     # valid KEY=value
+    /^[[:space:]]*$/ { next }         # skip empty
+    /^#/ { next }                     # skip comments
+    { print NR ":" $0 }               # everything else is invalid
+  ' "$env_file")
+
+  if [[ -n "$bad_lines" ]]; then
+    log "ERROR: Invalid or multiline entries detected:"
+    echo "$bad_lines"
+    return 2
+  fi
+
+  log "ENV validation passed"
+  return 0
+}
+
+# Attempt to repair wrapped or multiline base64 values in .env
+repair_env_file() {
+  local env_file="/opt/netbox/.env"
+  log "Attempting automatic repair of ${env_file}"
+
+  if [[ ! -f "$env_file" ]]; then
+    log "ERROR: Cannot repair missing .env file"
+    return 1
+  fi
+
+  # Backup before modifying
+  cp "$env_file" "${env_file}.bak.$(date +%Y%m%d-%H%M%S)"
+
+  # Join any wrapped base64 fragments into a single line
+  awk '
+    /^[A-Za-z0-9_]+=/{ 
+        if (key) print key "=" value
+        split($0, kv, "=")
+        key=kv[1]
+        value=kv[2]
+        next
+    }
+    /^[A-Za-z0-9+\/]+=*$/ {
+        value = value $0
+        next
+    }
+    {
+        if (key) print key "=" value
+        key=""
+        value=""
+        print $0
+    }
+    END {
+        if (key) print key "=" value
+    }
+  ' "$env_file" > "${env_file}.fixed"
+
+  mv "${env_file}.fixed" "$env_file"
+  log "ENV repair complete"
+}
+
+# Generate a safe, single‑line base64 secret (never wraps)
+generate_safe_secret() {
+  openssl rand -base64 50 | tr -d '\n'
+}
+
+# ------------------------------------------------------------
+# ENV VALIDATION WORKFLOW (call this before sourcing .env)
+# ------------------------------------------------------------
+validate_and_repair_env() {
+  validate_env_file || {
+    log "ENV file invalid — attempting repair"
+    repair_env_file
+    validate_env_file || {
+      log "ERROR: ENV file still invalid after repair"
+      exit 1
+    }
+  }
+}
 
 ########################################
 # ENV AUTOLOAD (authoritative)
 ########################################
 NETBOX_ENV="/opt/netbox/.env"
 if [[ -f "$NETBOX_ENV" ]]; then
+  validate_and_repair_env
   set -a
   source "$NETBOX_ENV"
   set +a
@@ -85,7 +177,8 @@ generate_netbox_tokens() {
     local timestamp
     timestamp=$(date +"%Y%m%d-%H%M%S")
     local log_file="${log_dir}/token-gen-${timestamp}.log"
-    local container="netbox"
+    local container
+    container="$(docker ps --format '{{.Names}}' | grep -E '^netbox|netbox-netdisco-web' | head -n 1)"
     local superuser="admin"
 
     mkdir -p "$log_dir"
@@ -510,7 +603,7 @@ discovery_apply_full() {
 
 
 # ------------------------------------------------------------
-# End 1.9.16 additions
+# End 1.9.17 additions
 # ------------------------------------------------------------
 
 # ------------------------------------------------------------
