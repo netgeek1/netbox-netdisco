@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # NetBox Docker All-in-One Installer & Manager (+ Discovery + Plugins)
-# Version: 1.9.18
+# Version: 1.9.19
 # Baseline: v1.2.8 (LOCKED)
 # ============================================================
 # v1.3.x features (kept intact):
@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.9.18"
+SCRIPT_VERSION="1.9.19"
 
 # Script identity (helps detect running the wrong file/version)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -90,7 +90,7 @@ set_env_kv() {
 }
 
 # ------------------------------------------------------------
-# Begin 1.9.18 additions
+# Begin 1.9.19 additions
 # ------------------------------------------------------------
 ### =================================================
 ### BEGIN - NETBOX AUTH / TOKEN / PRIVILEGE FRAMEWORK
@@ -636,7 +636,7 @@ discovery_apply_full() {
 
 
 # ------------------------------------------------------------
-# End 1.9.18 additions
+# End 1.9.19 additions
 # ------------------------------------------------------------
 
 # ------------------------------------------------------------
@@ -846,6 +846,7 @@ SUPERUSER_NAME=admin
 SUPERUSER_EMAIL=admin@example.com
 SUPERUSER_PASSWORD=admin
 EOF
+sudo sed -i ':a;N;$!ba;s/\n\([A-Za-z0-9+\/]\{2,\}=\)/\1/' $INSTALL_DIR/.env
 }
 
 generate_netdisco_env() {
