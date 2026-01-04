@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # NetBox Docker All-in-One Installer & Manager (+ Discovery + Plugins)
-# Version: 1.9.17
+# Version: 1.9.18
 # Baseline: v1.2.8 (LOCKED)
 # ============================================================
 # v1.3.x features (kept intact):
@@ -30,11 +30,12 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.9.17"
+SCRIPT_VERSION="1.9.18"
 
 # Script identity (helps detect running the wrong file/version)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_BASENAME="$(basename "$SCRIPT_PATH")"
+
 
 # ------------------------------------------------------------
 # Auto sudo
@@ -46,7 +47,50 @@ fi
 REAL_USER="${SUDO_USER:-root}"
 
 # ------------------------------------------------------------
-# Begin 1.9.17 additions
+# Helpers
+# ------------------------------------------------------------
+log()  { echo "[INFO] $*"; }
+warn() { echo "[WARN] $*" >&2; }
+err()  { echo "[ERROR] $*" >&2; }
+pause(){ read -rp "Press ENTER to continue..."; }
+
+write_state_install_dir() { echo "INSTALL_DIR=\"$1\"" > "$STATE_FILE"; }
+load_state_install_dir() { [[ -f "$STATE_FILE" ]] && source "$STATE_FILE" || true; }
+
+ensure_install_dir() {
+  load_state_install_dir
+  if [[ -n "${INSTALL_DIR:-}" && -d "${INSTALL_DIR:-}" ]]; then
+    return
+  fi
+
+  read -rp "Install directory [$DEFAULT_INSTALL_DIR]: " INSTALL_DIR
+  INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
+  mkdir -p "$INSTALL_DIR"
+  write_state_install_dir "$INSTALL_DIR"
+}
+
+cd_install_dir() { ensure_install_dir; cd "$INSTALL_DIR"; }
+as_user() { sudo -u "$REAL_USER" "$@"; }
+
+# Ensure KEY=VALUE exists in a file; append if missing
+ensure_kv() { grep -q "^$2=" "$1" || echo "$2=$3" >> "$1"; }
+
+# Replace-or-append KEY=VALUE in env file
+set_env_kv() {
+  local file="$1" key="$2" val="$3"
+  if [[ ! -f "$file" ]]; then
+    echo "${key}=${val}" > "$file"
+    return
+  fi
+  if grep -qE "^${key}=" "$file"; then
+    sed -i "s#^${key}=.*#${key}=${val}#g" "$file"
+  else
+    echo "${key}=${val}" >> "$file"
+  fi
+}
+
+# ------------------------------------------------------------
+# Begin 1.9.18 additions
 # ------------------------------------------------------------
 ### =================================================
 ### BEGIN - NETBOX AUTH / TOKEN / PRIVILEGE FRAMEWORK
@@ -177,62 +221,60 @@ generate_netbox_tokens() {
     local timestamp
     timestamp=$(date +"%Y%m%d-%H%M%S")
     local log_file="${log_dir}/token-gen-${timestamp}.log"
-    local container
-    container="$(docker ps --format '{{.Names}}' | grep -E '^netbox|netbox-netdisco-web' | head -n 1)"
-    local superuser="admin"
 
     mkdir -p "$log_dir"
-    echo "[INFO] Token generation started at ${timestamp}" | tee -a "$log_file"
+    log "Token generation started at ${timestamp}" | tee -a "$log_file"
 
-    # Check for existing tokens (idempotency)
+    # Detect NetBox container
+    local container
+    container="$(docker ps --format '{{.Names}}' | grep -E '^netbox-netbox' | head -n 1)"
+
+    if [[ -z "$container" ]]; then
+        log "ERROR: No NetBox container found" | tee -a "$log_file"
+        return 1
+    fi
+
+    log "Using NetBox container: ${container}" | tee -a "$log_file"
+
+    # Load admin password from environment
+    local admin_pass
+    admin_pass=$(docker exec "$container" printenv SUPERUSER_PASSWORD)
+
+    if [[ -z "$admin_pass" ]]; then
+        log "ERROR: SUPERUSER_PASSWORD not set in container" | tee -a "$log_file"
+        return 1
+    fi
+
+    # Idempotency: check existing secrets
     if [[ -f "$secrets_file" ]]; then
         source "$secrets_file"
-
         if [[ -n "$NETBOX_API_TOKEN_RW" && -n "$NETBOX_API_TOKEN_RO" ]]; then
-            echo "[INFO] Existing tokens detected. Skipping regeneration." | tee -a "$log_file"
-            echo "[INFO] RW token length: ${#NETBOX_API_TOKEN_RW}" | tee -a "$log_file"
-            echo "[INFO] RO token length: ${#NETBOX_API_TOKEN_RO}" | tee -a "$log_file"
+            log "Existing tokens detected — skipping regeneration" | tee -a "$log_file"
             return 0
-        else
-            echo "[WARN] Secrets file exists but tokens are missing or empty." | tee -a "$log_file"
         fi
-    else
-        echo "[WARN] Secrets file not found. Creating new one." | tee -a "$log_file"
     fi
 
-    echo "[INFO] Generating new NetBox API tokens..." | tee -a "$log_file"
+    log "Generating new NetBox API tokens via REST API..." | tee -a "$log_file"
 
-    # Ensure container is running
-    if ! docker ps --format '{{.Names}}' | grep -q "^${container}$"; then
-        echo "[ERROR] NetBox container '${container}' is not running." | tee -a "$log_file"
-        return 1
-    fi
-
-    # Generate RW token
+    # Create RW token
     local token_rw
-    token_rw=$(docker exec -u root "${container}" \
-        python3 /opt/netbox/netbox/manage.py tokens create "${superuser}" --write-enabled \
-        | awk '/Key:/ {print $2}')
+    token_rw=$(curl -s -X POST "http://localhost:8000/api/users/tokens/" \
+        -H "Content-Type: application/json" \
+        -d '{"description": "RW token", "write_enabled": true}' \
+        -u "admin:${admin_pass}" | jq -r '.key')
 
-    if [[ -z "$token_rw" ]]; then
-        echo "[ERROR] Failed to generate RW token." | tee -a "$log_file"
-        return 1
-    fi
-    echo "[INFO] RW token generated." | tee -a "$log_file"
-
-    # Generate RO token
+    # Create RO token
     local token_ro
-    token_ro=$(docker exec -u root "${container}" \
-        python3 /opt/netbox/netbox/manage.py tokens create "${superuser}" \
-        | awk '/Key:/ {print $2}')
+    token_ro=$(curl -s -X POST "http://localhost:8000/api/users/tokens/" \
+        -H "Content-Type: application/json" \
+        -d '{"description": "RO token", "write_enabled": false}' \
+        -u "admin:${admin_pass}" | jq -r '.key')
 
-    if [[ -z "$token_ro" ]]; then
-        echo "[ERROR] Failed to generate RO token." | tee -a "$log_file"
+    if [[ -z "$token_rw" || -z "$token_ro" ]]; then
+        log "ERROR: Failed to generate tokens via API" | tee -a "$log_file"
         return 1
     fi
-    echo "[INFO] RO token generated." | tee -a "$log_file"
 
-    # Write tokens to secrets file
     mkdir -p "$(dirname "$secrets_file")"
     {
         echo "NETBOX_API_TOKEN_RW=${token_rw}"
@@ -240,20 +282,11 @@ generate_netbox_tokens() {
     } > "$secrets_file"
 
     chmod 600 "$secrets_file"
-    echo "[INFO] Tokens written to ${secrets_file}" | tee -a "$log_file"
 
-    # Verification
-    source "$secrets_file"
-    if [[ -n "$NETBOX_API_TOKEN_RW" && -n "$NETBOX_API_TOKEN_RO" ]]; then
-        echo "[INFO] Token verification successful." | tee -a "$log_file"
-    else
-        echo "[ERROR] Token verification failed." | tee -a "$log_file"
-        return 1
-    fi
-
-    echo "[INFO] Token generation completed successfully." | tee -a "$log_file"
-    return 0
+    log "Tokens written to ${secrets_file}" | tee -a "$log_file"
+    log "Token generation completed successfully" | tee -a "$log_file"
 }
+
 
 ########################################
 # TOKEN VALIDATION
@@ -603,7 +636,7 @@ discovery_apply_full() {
 
 
 # ------------------------------------------------------------
-# End 1.9.17 additions
+# End 1.9.18 additions
 # ------------------------------------------------------------
 
 # ------------------------------------------------------------
@@ -709,58 +742,6 @@ DISC_CLOUD_AWS=0
 DISC_CLOUD_AZURE=0
 DISC_CLOUD_GCP=0
 DISC_ACTIVE_SCANNING=0
-
-# ------------------------------------------------------------
-# Auto sudo
-# ------------------------------------------------------------
-if [[ $EUID -ne 0 ]]; then
-  exec sudo -E bash "$0" "$@"
-fi
-
-REAL_USER="${SUDO_USER:-root}"
-
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
-log()  { echo "[INFO] $*"; }
-warn() { echo "[WARN] $*" >&2; }
-err()  { echo "[ERROR] $*" >&2; }
-pause(){ read -rp "Press ENTER to continue..."; }
-
-write_state_install_dir() { echo "INSTALL_DIR=\"$1\"" > "$STATE_FILE"; }
-load_state_install_dir() { [[ -f "$STATE_FILE" ]] && source "$STATE_FILE" || true; }
-
-ensure_install_dir() {
-  load_state_install_dir
-  if [[ -n "${INSTALL_DIR:-}" && -d "${INSTALL_DIR:-}" ]]; then
-    return
-  fi
-
-  read -rp "Install directory [$DEFAULT_INSTALL_DIR]: " INSTALL_DIR
-  INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
-  mkdir -p "$INSTALL_DIR"
-  write_state_install_dir "$INSTALL_DIR"
-}
-
-cd_install_dir() { ensure_install_dir; cd "$INSTALL_DIR"; }
-as_user() { sudo -u "$REAL_USER" "$@"; }
-
-# Ensure KEY=VALUE exists in a file; append if missing
-ensure_kv() { grep -q "^$2=" "$1" || echo "$2=$3" >> "$1"; }
-
-# Replace-or-append KEY=VALUE in env file
-set_env_kv() {
-  local file="$1" key="$2" val="$3"
-  if [[ ! -f "$file" ]]; then
-    echo "${key}=${val}" > "$file"
-    return
-  fi
-  if grep -qE "^${key}=" "$file"; then
-    sed -i "s#^${key}=.*#${key}=${val}#g" "$file"
-  else
-    echo "${key}=${val}" >> "$file"
-  fi
-}
 
 # ------------------------------------------------------------
 # Docker install & prerequisites (Ubuntu/Debian)
