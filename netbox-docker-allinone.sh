@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # NetBox Docker All-in-One Installer & Manager (+ Discovery + Plugins)
-# Version: 1.9.19
+# Version: 1.9.20
 # Baseline: v1.2.8 (LOCKED)
 # ============================================================
 # v1.3.x features (kept intact):
@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.9.19"
+SCRIPT_VERSION="1.9.20"
 
 # Script identity (helps detect running the wrong file/version)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -90,7 +90,7 @@ set_env_kv() {
 }
 
 # ------------------------------------------------------------
-# Begin 1.9.19 additions
+# Begin 1.9.20 additions
 # ------------------------------------------------------------
 ### =================================================
 ### BEGIN - NETBOX AUTH / TOKEN / PRIVILEGE FRAMEWORK
@@ -191,10 +191,20 @@ validate_and_repair_env() {
 # ENV AUTOLOAD (authoritative)
 ########################################
 NETBOX_ENV="/opt/netbox/.env"
+NETBOX_SECRETS="/opt/netbox/secrets/secrets.env"
+
 if [[ -f "$NETBOX_ENV" ]]; then
   validate_and_repair_env
   set -a
   source "$NETBOX_ENV"
+  set +a
+fi
+
+# Idempotent secrets autoload (if tokens already exist on disk)
+if [[ -f "$NETBOX_SECRETS" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$NETBOX_SECRETS"
   set +a
 fi
 
@@ -245,11 +255,13 @@ generate_netbox_tokens() {
         return 1
     fi
 
-    # Idempotency: check existing secrets
+    # Idempotency: if secrets file already has tokens, load and return
     if [[ -f "$secrets_file" ]]; then
+        # shellcheck disable=SC1090
         source "$secrets_file"
-        if [[ -n "$NETBOX_API_TOKEN_RW" && -n "$NETBOX_API_TOKEN_RO" ]]; then
-            log "Existing tokens detected — skipping regeneration" | tee -a "$log_file"
+        if [[ -n "${NETBOX_API_TOKEN_RW:-}" && -n "${NETBOX_API_TOKEN_RO:-}" ]]; then
+            export NETBOX_API_TOKEN_RW NETBOX_API_TOKEN_RO
+            log "Existing tokens detected — loaded into environment, skipping regeneration" | tee -a "$log_file"
             return 0
         fi
     fi
@@ -283,34 +295,56 @@ generate_netbox_tokens() {
 
     chmod 600 "$secrets_file"
 
+    # Reload secrets into current environment (authoritative)
+    set -a
+    # shellcheck disable=SC1090
+    source "$secrets_file"
+    set +a
+
+    # Post-generation sanity check
+    if [[ -z "${NETBOX_API_TOKEN_RW:-}" || -z "${NETBOX_API_TOKEN_RO:-}" ]]; then
+        log "ERROR: Secrets file missing required tokens after write" | tee -a "$log_file"
+        return 1
+    fi
+
+    export NETBOX_API_TOKEN_RW NETBOX_API_TOKEN_RO
+
     log "Tokens written to ${secrets_file}" | tee -a "$log_file"
     log "Token generation completed successfully" | tee -a "$log_file"
 }
-
 
 ########################################
 # TOKEN VALIDATION
 ########################################
 netbox_validate_token() {
-  local mode="$1"
-  local token_var
+    local mode="$1"
+    local token_var
 
-  case "$mode" in
-    RO) token_var="NETBOX_API_TOKEN_RO" ;;
-    RW) token_var="NETBOX_API_TOKEN_RW" ;;
-    *)
-      echo "[FATAL] Invalid token mode: $mode"
-      exit 1
-      ;;
-  esac
+    case "$mode" in
+        RO) token_var="NETBOX_API_TOKEN_RO" ;;
+        RW) token_var="NETBOX_API_TOKEN_RW" ;;
+        *)
+            echo "[FATAL] Invalid token mode: $mode"
+            exit 1
+            ;;
+    esac
 
-  if [[ -z "${!token_var:-}" ]]; then
-    echo "[ERROR] Required NetBox token missing: $token_var"
-    exit 1
-  fi
+    # Lazy reload from secrets file if token missing
+    if [[ -z "${!token_var:-}" && -n "${NETBOX_SECRETS:-}" && -f "$NETBOX_SECRETS" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "$NETBOX_SECRETS"
+        set +a
+    fi
 
-  export NETBOX_TOKEN="${!token_var}"
+    if [[ -z "${!token_var:-}" ]]; then
+        echo "[ERROR] Required NetBox token missing: $token_var"
+        exit 1
+    fi
+
+    export NETBOX_TOKEN="${!token_var}"
 }
+
 
 ########################################
 # NETBOX API WRAPPER (PRIVILEGE AWARE)
@@ -636,7 +670,7 @@ discovery_apply_full() {
 
 
 # ------------------------------------------------------------
-# End 1.9.19 additions
+# End 1.9.20 additions
 # ------------------------------------------------------------
 
 # ------------------------------------------------------------
